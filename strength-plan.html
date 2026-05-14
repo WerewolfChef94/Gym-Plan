@@ -1,0 +1,1175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Strength Plan">
+<meta name="theme-color" content="#0f0f0f">
+<title>Home Strength Plan</title>
+<link rel="manifest" href="#" id="manifest-placeholder">
+<style>
+  * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #0f0f0f; }
+  body { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
+  #root { min-height: 100vh; }
+  /* Prevent text selection on tap */
+  button { -webkit-user-select: none; user-select: none; }
+  /* Smooth scrolling */
+  * { -webkit-overflow-scrolling: touch; }
+  /* Loading screen */
+  #loading { position: fixed; inset: 0; background: #0f0f0f; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 9999; }
+  #loading h1 { font-family: sans-serif; font-size: 2rem; color: #e8ff00; letter-spacing: 0.1em; margin: 0 0 8px; }
+  #loading p { font-family: sans-serif; color: #555; font-size: 14px; margin: 0; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+  #loading p { animation: pulse 1.5s infinite; }
+</style>
+<!-- Google Fonts preconnect -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+<div id="loading">
+  <h1>STRENGTH</h1>
+  <p>Loading your plan...</p>
+</div>
+<div id="root"></div>
+
+<!-- React + Babel from CDN -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useRef } = React;
+
+
+
+// ─── Rank System ──────────────────────────────────────────────────────────────
+// ELO-style rating (RP = Rank Points). Starts at 0.
+// Each rank tier has 3 divisions (III → II → I), except Radiant (single tier).
+// Weekly decay: if you earn < threshold RP that week, you lose RP scaled to your rank.
+// NO floor protection — you can drop full divisions. Only floor is 0 (Iron III).
+// Higher ranks decay harder: the treadmill speeds up as you climb.
+
+const RANKS = [
+  { name: "Iron",     divisions: 3, color: "#8c7b6b", glow: "#8c7b6b", thresholds: [0, 200, 400] },
+  { name: "Bronze",   divisions: 3, color: "#cd7f32", glow: "#cd7f32", thresholds: [600, 900, 1200] },
+  { name: "Silver",   divisions: 3, color: "#aab8c2", glow: "#c0c0c0", thresholds: [1500, 1900, 2300] },
+  { name: "Gold",     divisions: 3, color: "#ffd700", glow: "#ffd700", thresholds: [2700, 3300, 3900] },
+  { name: "Platinum", divisions: 3, color: "#00d4aa", glow: "#00ffcc", thresholds: [4500, 5400, 6300] },
+  { name: "Diamond",  divisions: 3, color: "#00bfff", glow: "#00e5ff", thresholds: [7200, 8600, 10000] },
+  { name: "Radiant",  divisions: 1, color: "#ff00ff", glow: "#ff66ff", thresholds: [11500] },
+];
+
+// Flat RP thresholds array for easy lookup
+const RP_THRESHOLDS = RANKS.flatMap(r =>
+  r.divisions === 1 ? [{ rank: r, div: 1, rp: r.thresholds[0] }]
+  : r.thresholds.map((rp, i) => ({ rank: r, div: r.divisions - i, rp }))
+);
+// Total tiers
+const TOTAL_TIERS = RP_THRESHOLDS.length; // 19
+
+function getRankInfo(rp) {
+  const clamped = Math.max(0, rp);
+  let tier = 0;
+  for (let i = RP_THRESHOLDS.length - 1; i >= 0; i--) {
+    if (clamped >= RP_THRESHOLDS[i].rp) { tier = i; break; }
+  }
+  const current = RP_THRESHOLDS[tier];
+  const next = RP_THRESHOLDS[tier + 1] || null;
+  const tierStart = current.rp;
+  const tierEnd = next ? next.rp : tierStart + 2000;
+  const tierRange = tierEnd - tierStart;
+  const progress = Math.min(100, Math.round(((clamped - tierStart) / tierRange) * 100));
+  return {
+    rank: current.rank,
+    div: current.div,
+    tierIndex: tier,
+    tierStart,
+    tierEnd,
+    progress,
+    rp: clamped,
+    rpInTier: clamped - tierStart,
+    rpToNext: next ? Math.max(0, next.rp - clamped) : 0,
+    isMax: tier === TOTAL_TIERS - 1,
+    label: current.rank.divisions === 1 ? current.rank.name : `${current.rank.name} ${["III","II","I"][current.div - 1] || "I"}`,
+  };
+}
+
+// Decay scales with rank — higher rank = punished harder for going inactive.
+// No floor protection. Can drop across full divisions. Only floor is 0.
+const DECAY_BY_RANK = {
+  Iron:     { threshold:  80, loss: 100 },
+  Bronze:   { threshold: 100, loss: 150 },
+  Silver:   { threshold: 120, loss: 200 },
+  Gold:     { threshold: 150, loss: 280 },
+  Platinum: { threshold: 180, loss: 380 },
+  Diamond:  { threshold: 220, loss: 500 },
+  Radiant:  { threshold: 280, loss: 700 },
+};
+
+// ─── Workout Data ─────────────────────────────────────────────────────────────
+const DAYS = [
+  {
+    id: 1, title: "Upper Body Push", muscles: "Chest · Shoulders · Triceps", duration: "35–40", color: "#e8ff00",
+    warmup: [{ name: "Arm circles + shoulder rolls", note: "30 sec each direction" }, { name: "Bodyweight press-ups", note: "10 reps, easy pace" }],
+    exercises: [
+      { name: "Dumbbell Floor Press", muscle: "Chest · Triceps", sets: 3, reps: 10, restSec: 75, steps: ["Lie flat on your back, knees bent. Hold a dumbbell at chest height, elbows at 45°.", "Press both dumbbells straight up to full extension.", "Lower slowly until upper arms touch the floor, then press again."], cues: ["Keep wrists straight — don't let them bend back.", "The floor is a natural safety stop — great for beginners.", "Squeeze your chest at the top of every rep."] },
+      { name: "Dumbbell Overhead Press", muscle: "Shoulders · Triceps", sets: 3, reps: 10, restSec: 75, steps: ["Sit or stand with a dumbbell at each shoulder, palms forward.", "Brace your core and press both dumbbells straight overhead.", "Lower slowly back to shoulder height over 2 seconds."], cues: ["Don't arch your lower back — core stays tight.", "Keep dumbbells directly over shoulders.", "Seated version is easier for strict form when starting out."] },
+      { name: "Dumbbell Lateral Raise", muscle: "Side Deltoids", sets: 3, reps: 12, restSec: 60, steps: ["Stand, dumbbell in each hand by your sides, slight elbow bend.", "Raise both arms out to the sides until level with your shoulders.", "Pause at the top, then lower slowly."], cues: ["Use lighter weight than you think — form breaks down fast here.", "Lead with your elbows, not your hands.", "Don't shrug your shoulders as you raise."] },
+      { name: "Curl Bar Skull Crushers", muscle: "Triceps", sets: 3, reps: 10, restSec: 75, steps: ["Lie on your back, arms extended above chest holding the curl bar.", "Keeping upper arms fixed, slowly bend elbows to lower bar toward forehead.", "Stop just before your head, then extend arms back to start."], cues: ["Only your forearms pivot — upper arms stay vertical.", "Go slow on the descent.", "Start light until the movement feels natural."] },
+      { name: "Dumbbell Tricep Kickbacks", muscle: "Triceps", sets: 2, reps: 12, restSec: 60, steps: ["Hold a dumbbell and hinge forward until torso is nearly parallel to the floor.", "Tuck your upper arm to your side so elbow is at 90°.", "Extend your forearm straight back until fully extended, hold a second.", "Return slowly. Complete all reps then switch arms."], cues: ["Elbow stays pinned to your side throughout.", "Control the return — don't let it swing.", "Keep the weight light."] },
+    ],
+    cooldown: [{ name: "Chest doorframe + overhead tricep stretch", note: "30 sec each side" }],
+  },
+  {
+    id: 2, title: "Lower Body + Core", muscles: "Quads · Hamstrings · Glutes · Abs", duration: "35–40", color: "#ff6b35",
+    warmup: [{ name: "Bodyweight squats", note: "10 slow reps, full depth" }, { name: "Leg swings (forward + lateral)", note: "10 per leg" }],
+    exercises: [
+      { name: "Dumbbell Goblet Squat", muscle: "Quads · Glutes · Core", sets: 3, reps: 12, restSec: 75, steps: ["Hold one dumbbell vertically at your chest with both hands.", "Feet shoulder-width, toes slightly out. Push hips back and squat down.", "Drive through heels to stand back up."], cues: ["Chest tall, back straight.", "Knees track over toes, not caving inward.", "Heels flat on the floor throughout."] },
+      { name: "Dumbbell Romanian Deadlift", muscle: "Hamstrings · Glutes · Lower Back", sets: 3, reps: 10, restSec: 75, steps: ["Stand tall, dumbbells in front of thighs, palms facing you.", "Hinge at hips — push them back and lower dumbbells down your legs.", "Lower until you feel a strong hamstring stretch, then drive hips forward."], cues: ["Slight knee bend throughout — this is a hip hinge, not a squat.", "Flat back at all times.", "Think: push your hips to the wall behind you."] },
+      { name: "Dumbbell Reverse Lunge", muscle: "Quads · Glutes · Balance", sets: 3, reps: 10, restSec: 75, steps: ["Stand with dumbbells at your sides.", "Step one foot straight back and lower back knee toward the floor.", "Front thigh parallel to floor, knee over ankle. Push through front heel to stand."], cues: ["Torso stays upright — don't lean forward.", "Stepping back is kinder to the knees.", "Long enough stride so front knee stays over ankle."] },
+      { name: "Glute Bridge", muscle: "Glutes · Hamstrings · Core", sets: 3, reps: 15, restSec: 60, steps: ["Lie on back, knees bent, feet flat hip-width apart.", "Squeeze glutes and push hips up until body forms a straight line.", "Hold 1 second at the top, then lower slowly."], cues: ["Drive through heels, not toes.", "Place a dumbbell across your hips to add resistance.", "Don't hyperextend your lower back."] },
+      { name: "Plank Hold", muscle: "Core · Shoulders · Stability", sets: 3, reps: null, restSec: 60, timedSec: 25, steps: ["Forearms on floor, elbows below shoulders. Extend legs, rest on toes.", "Brace core and squeeze glutes — straight line from head to heel.", "Hold for the target time, breathing steadily."], cues: ["Hips must not sag down or pike up.", "Look at the floor — keep neck neutral.", "A perfect 20s beats a saggy 60s every time."] },
+      { name: "Dead Bug", muscle: "Deep Core · Stability", sets: 2, reps: 10, restSec: 60, steps: ["Lie on back, arms up toward ceiling, knees at 90° raised in air.", "Lower right arm overhead while extending left leg toward the floor.", "Lower back must stay pressed flat throughout.", "Return to start, repeat opposite side. That's one rep."], cues: ["If back lifts off the floor, shorten the range.", "Slow and deliberate — control beats speed.", "Breathe out as you extend, in as you return."] },
+    ],
+    cooldown: [{ name: "Hip flexor + seated hamstring stretch", note: "45 sec each side" }],
+  },
+  {
+    id: 3, title: "Upper Body Pull", muscles: "Back · Biceps · Rear Delts", duration: "35–40", color: "#00e5ff",
+    warmup: [{ name: "Light DB pull-aparts", note: "15 reps" }, { name: "Cat-cow stretch", note: "8 slow reps" }],
+    exercises: [
+      { name: "Dumbbell Bent-Over Row", muscle: "Upper Back · Lats · Biceps", sets: 3, reps: 10, restSec: 75, steps: ["Hold dumbbells, hinge at hips until torso is roughly 45° to the floor.", "Let dumbbells hang straight down from shoulders.", "Row both up toward your hips, driving elbows back behind you.", "Squeeze shoulder blades together at the top, then lower slowly."], cues: ["Row to hips, not chest — targets back far better.", "Keep your back flat — no rounding.", "Pull with your elbows, not your hands."] },
+      { name: "Curl Bar Bicep Curl", muscle: "Biceps · Forearms", sets: 3, reps: 10, restSec: 75, steps: ["Stand, underhand grip on curl bar, hands shoulder-width, arms extended.", "Upper arms pinned to sides — curl bar up toward your chest.", "Squeeze biceps hard at the top.", "Lower slowly over at least 2 seconds."], cues: ["Don't swing your body or rock elbows forward.", "The EZ bar angle is easier on the wrists.", "Full extension at the bottom on every rep."] },
+      { name: "Single-Arm Dumbbell Row", muscle: "Lats · Upper Back", sets: 3, reps: 10, restSec: 75, steps: ["One hand and same-side knee on a bench/chair for support.", "Hold dumbbell in opposite hand, let it hang straight down.", "Row dumbbell toward your hip, elbow pulling straight up.", "Lower slowly. Complete all reps then switch sides."], cues: ["Torso stays parallel to floor — don't rotate.", "Elbow drives up and back, not out to the side.", "Pause and feel the back squeeze at the top."] },
+      { name: "Dumbbell Rear Delt Fly", muscle: "Rear Deltoids · Upper Back", sets: 3, reps: 12, restSec: 60, steps: ["Hinge forward, chest near thighs. Dumbbells hanging below, palms facing each other.", "With slight elbow bend, raise both arms out to the sides to back height.", "Squeeze shoulder blades, then lower slowly."], cues: ["Light weight only — rear delts tire quickly.", "Lead with elbows, not hands.", "Avoid jerking — slow and controlled wins here."] },
+      { name: "Hammer Curl", muscle: "Biceps · Brachialis · Forearms", sets: 2, reps: 12, restSec: 60, steps: ["Stand, neutral grip dumbbells (palms facing each other), arms extended.", "Keeping upper arms still, curl both dumbbells to shoulders.", "Squeeze at the top, then lower slowly."], cues: ["Neutral grip hits the brachialis under the bicep.", "Can be done together or alternating.", "Wrists stay locked in neutral."] },
+    ],
+    cooldown: [{ name: "Bicep wall stretch + cross-body shoulder stretch", note: "30 sec each side" }],
+  },
+  {
+    id: 4, title: "Full Body + Core", muscles: "Compound Movements · Abs · Endurance", duration: "40–45", color: "#bf5fff",
+    warmup: [{ name: "Jumping jacks or marching on the spot", note: "2 minutes" }, { name: "Bodyweight squat + push-up combo", note: "5 rounds easy" }],
+    exercises: [
+      { name: "Dumbbell Deadlift", muscle: "Hamstrings · Glutes · Back · Core", sets: 3, reps: 10, restSec: 90, steps: ["Feet hip-width, dumbbells at sides of feet.", "Hinge and bend knees to grip dumbbells, back flat, chest up.", "Drive through heels, extend hips and knees to stand tall.", "Lower with control back to the floor, flat back throughout."], cues: ["Think 'push the floor away' not 'pull the weight up'.", "Keep dumbbells close to your legs throughout.", "Lock out fully — squeeze glutes and stand completely tall."] },
+      { name: "Curl Bar Push Press", muscle: "Shoulders · Triceps · Legs", sets: 3, reps: 8, restSec: 90, steps: ["Curl bar at shoulder height, overhand grip, elbows slightly forward.", "Small quick knee dip.", "Drive through legs and press bar overhead to full extension.", "Lower bar to shoulders under control and repeat."], cues: ["The leg drive is the whole point — don't skip it.", "Core braced — don't arch lower back.", "Slightly heavier than strict press is possible."] },
+      { name: "Dumbbell Farmer's Carry", muscle: "Grip · Core · Traps · Conditioning", sets: 3, reps: null, restSec: 75, steps20: true, steps: ["Pick up a heavy dumbbell in each hand.", "Stand tall, shoulders pulled back and down.", "Walk forward with controlled deliberate steps for 20 paces.", "Set weights down carefully, rest, repeat."], cues: ["Don't let weight pull shoulders forward.", "Core braced like you're about to take a punch.", "Shorter controlled steps — don't waddle."] },
+      { name: "Dumbbell Thruster", muscle: "Full Body · Quads · Shoulders", sets: 3, reps: 8, restSec: 90, steps: ["Dumbbells at shoulder height, feet shoulder-width.", "Squat until thighs are parallel to the floor.", "As you drive up, press both dumbbells overhead in one smooth movement.", "Lower to shoulders as you descend into the next squat."], cues: ["The press is a natural extension of the squat — one fluid motion.", "Keep dumbbells close to your head as they pass through.", "Use moderate weight — this is one of the hardest moves."] },
+      { name: "Russian Twist", muscle: "Obliques · Core", sets: 3, reps: 16, restSec: 60, steps: ["Sit, knees bent, feet flat or raised. Lean back to roughly 45°.", "Hold a dumbbell or clasp hands at chest height.", "Rotate torso right, bringing weight toward hip.", "Rotate back through centre and to the left. That's one rep."], cues: ["Rotation comes from your torso, not just swinging arms.", "Chest tall — don't hunch forward as you twist.", "Start feet on floor if raised version is too difficult."] },
+      { name: "Mountain Climbers", muscle: "Core · Cardio · Hip Flexors", sets: 2, reps: null, restSec: 60, timedSec: 20, steps: ["High plank position — hands below shoulders, body in a straight line.", "Drive right knee toward chest.", "Quickly switch — right leg extends as left knee drives in.", "Continue alternating at a steady pace."], cues: ["Hips stay level — don't bob up and down.", "Core braced — this is a moving plank.", "Steady pace beats frantic speed; form first."] },
+    ],
+    cooldown: [{ name: "Full body stretch: quads, hamstrings, chest, back, shoulders", note: "30 sec per stretch" }],
+  },
+];
+
+// ─── Storage ──────────────────────────────────────────────────────────────────
+const SCORES_KEY = "ws_scores_v4";
+const STREAK_KEY = "ws_streak_v4";
+const ELO_KEY    = "ws_elo_v4";
+const MONTH_NAMES = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+const DAY_LABELS  = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"];
+
+function loadScores() { try { return JSON.parse(localStorage.getItem(SCORES_KEY) || "{}"); } catch { return {}; } }
+function saveScores(s) { try { localStorage.setItem(SCORES_KEY, JSON.stringify(s)); } catch {} }
+function loadStreak() { try { return JSON.parse(localStorage.getItem(STREAK_KEY) || '{"count":0,"lastDate":null}'); } catch { return { count:0,lastDate:null }; } }
+function saveStreak(s) { try { localStorage.setItem(STREAK_KEY, JSON.stringify(s)); } catch {} }
+function loadElo() { try { return JSON.parse(localStorage.getItem(ELO_KEY) || '{"rp":0,"lastDecayWeek":null,"history":[]}'); } catch { return {rp:0,lastDecayWeek:null,history:[]}; } }
+function saveElo(e) { try { localStorage.setItem(ELO_KEY, JSON.stringify(e)); } catch {} }
+
+function todayKey() { return new Date().toISOString().slice(0, 10); }
+function pad(n) { return String(n).padStart(2,"0"); }
+function weekKey(dateStr) {
+  const d = new Date(dateStr + "T12:00:00");
+  const dow = d.getDay(); const mon = dow === 0 ? -6 : 1 - dow;
+  const monday = new Date(d); monday.setDate(d.getDate() + mon);
+  return monday.toISOString().slice(0,10);
+}
+
+function scoreColor(s) {
+  if (s >= 300) return "#ff00ff";
+  if (s >= 200) return "#e8ff00";
+  if (s >= 100) return "#b8cc00";
+  if (s >= 60)  return "#7a8800";
+  return "#4a5200";
+}
+
+// ─── Scoring ──────────────────────────────────────────────────────────────────
+function calcScore({ totalSetsDone, totalSetsNeeded, elapsedSec, streakDays }) {
+  const setsRatio = totalSetsNeeded > 0 ? totalSetsDone / totalSetsNeeded : 0;
+  const fullCompletion = setsRatio >= 1;
+  const mins = elapsedSec / 60;
+  const setsPts = Math.round(setsRatio * 70);
+  const speedBonus = mins <= 35 ? 20 : mins <= 40 ? 15 : mins <= 45 ? 10 : mins <= 55 ? 5 : 0;
+  const completionBonus = fullCompletion ? 10 : 0;
+  const base = setsPts + speedBonus + completionBonus;
+  const streakMult = streakDays >= 5 ? 3 : streakDays >= 4 ? 2.5 : streakDays >= 3 ? 2 : streakDays >= 2 ? 1.5 : 1;
+  const completionMult = fullCompletion ? 1.25 : 1;
+  const multiplied = Math.round(base * streakMult * completionMult);
+  return { base, setsPts, speedBonus, completionBonus, streakMult, completionMult, totalMult: +(streakMult * completionMult).toFixed(2), multiplied, fullCompletion, streakDays };
+}
+
+function checkWeekJackpot(scores, dateStr) {
+  const wk = weekKey(dateStr);
+  const d = new Date(wk + "T12:00:00");
+  const days = new Set();
+  for (let i = 0; i < 7; i++) {
+    const dd = new Date(d); dd.setDate(d.getDate() + i);
+    const k = dd.toISOString().slice(0,10);
+    if (Object.keys(scores).some(sk => sk.startsWith(k))) days.add(k);
+  }
+  return days.size >= 4;
+}
+
+function applyDecay(eloData, scores) {
+  const wk = weekKey(todayKey());
+  if (eloData.lastDecayWeek === wk) return eloData; // Already processed this week
+  if (!eloData.lastDecayWeek) return { ...eloData, lastDecayWeek: wk }; // First use
+
+  // Check last week's RP earned
+  const prevMonday = new Date(eloData.lastDecayWeek + "T12:00:00");
+  let weekEarned = 0;
+  for (let i = 0; i < 7; i++) {
+    const dd = new Date(prevMonday); dd.setDate(prevMonday.getDate() + i);
+    const k = dd.toISOString().slice(0, 10);
+    Object.entries(scores).forEach(([sk, sv]) => {
+      if (sk.startsWith(k)) weekEarned += sv.rpGained || 0;
+    });
+  }
+
+  // Get rank-scaled decay values based on rank at END of last week
+  const rankAtLastWeek = getRankInfo(eloData.rp);
+  const decay = DECAY_BY_RANK[rankAtLastWeek.rank.name];
+
+  if (weekEarned >= decay.threshold) {
+    return { ...eloData, lastDecayWeek: wk };
+  }
+
+  // Apply decay — NO floor protection, can drop divisions. Only floor is 0.
+  const newRp = Math.max(0, eloData.rp - decay.loss);
+  const decayAmount = eloData.rp - newRp;
+  const newRankInfo = getRankInfo(newRp);
+  const droppedRank = newRankInfo.tierIndex < rankAtLastWeek.tierIndex;
+  const label = droppedRank
+    ? `Inactive week — dropped to ${newRankInfo.label} (−${decayAmount} RP)`
+    : `Inactive week (−${decayAmount} RP)`;
+
+  return {
+    rp: newRp,
+    lastDecayWeek: wk,
+    history: [
+      { type: "decay", rp: -decayAmount, newTotal: newRp, date: todayKey(), label },
+      ...(eloData.history || []),
+    ].slice(0, 50),
+  };
+}
+
+// ─── Rank Badge Component ─────────────────────────────────────────────────────
+function RankBadge({ rp, size = "md" }) {
+  const info = getRankInfo(rp);
+  const { rank } = info;
+  const sizes = { sm: { outer: 36, icon: 18, label: 10 }, md: { outer: 52, icon: 26, label: 11 }, lg: { outer: 80, icon: 40, label: 13 } };
+  const s = sizes[size];
+  const rankIcons = { Iron: "⚙", Bronze: "🛡", Silver: "⚔", Gold: "👑", Platinum: "💎", Diamond: "🔷", Radiant: "✦" };
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 4 }}>
+      <div style={{ width: s.outer, height: s.outer, borderRadius: "50%", border: `2px solid ${rank.color}`, background: `${rank.color}18`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: s.icon, boxShadow: `0 0 12px ${rank.glow}44` }}>
+        {rankIcons[rank.name]}
+      </div>
+      {size !== "sm" && <div style={{ fontSize: s.label, color: rank.color, fontFamily: "'Bebas Neue',sans-serif", letterSpacing: "0.06em", whiteSpace: "nowrap" }}>{info.label}</div>}
+    </div>
+  );
+}
+
+// ─── Rank Progress Bar ────────────────────────────────────────────────────────
+function RankProgressBar({ rp }) {
+  const info = getRankInfo(rp);
+  const { rank } = info;
+  return (
+    <div style={{ background: "#1a1a1a", border: "1px solid #2e2e2e", borderRadius: 10, padding: "12px 14px" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 10 }}>
+        <RankBadge rp={rp} size="md" />
+        <div style={{ flex: 1 }}>
+          <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 22, color: rank.color, letterSpacing: "0.06em", lineHeight: 1 }}>{info.label}</div>
+          <div style={{ fontSize: 12, color: "#555", marginTop: 2 }}>{info.rp.toLocaleString()} RP total</div>
+        </div>
+        {!info.isMax && (
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: 11, color: "#555" }}>Next rank</div>
+            <div style={{ fontSize: 13, color: "#888", fontWeight: 600 }}>{info.rpToNext.toLocaleString()} RP</div>
+          </div>
+        )}
+      </div>
+      {!info.isMax && (
+        <div>
+          <div style={{ background: "#111", borderRadius: 4, height: 8, overflow: "hidden" }}>
+            <div style={{ height: "100%", width: `${info.progress}%`, background: `linear-gradient(90deg, ${rank.color}88, ${rank.color})`, borderRadius: 4, transition: "width 0.6s ease", boxShadow: `0 0 8px ${rank.glow}66` }} />
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#444", marginTop: 3 }}>
+            <span>{info.rpInTier.toLocaleString()} RP</span><span>{info.progress}%</span>
+          </div>
+        </div>
+      )}
+      {info.isMax && <div style={{ fontSize: 12, color: rank.color, textAlign: "center", marginTop: 4, fontFamily: "'Bebas Neue',sans-serif", letterSpacing: "0.1em" }}>MAXIMUM RANK ACHIEVED</div>}
+    </div>
+  );
+}
+
+// ─── Timers ───────────────────────────────────────────────────────────────────
+function RestTimer({ seconds, onDone }) {
+  const [left, setLeft] = useState(seconds);
+  useEffect(() => {
+    if (left <= 0) { onDone(); return; }
+    const t = setTimeout(() => setLeft(l => l - 1), 1000);
+    return () => clearTimeout(t);
+  }, [left, onDone]);
+  const pct = left / seconds * 100;
+  return (
+    <div style={{ background: "#111", border: "1px solid #2a2a2a", borderRadius: 10, padding: "1rem 1.25rem", marginTop: 8, display: "flex", alignItems: "center", gap: 14 }}>
+      <div style={{ position: "relative", width: 48, height: 48, flexShrink: 0 }}>
+        <svg width="48" height="48" style={{ transform: "rotate(-90deg)" }}>
+          <circle cx="24" cy="24" r="20" fill="none" stroke="#222" strokeWidth="4" />
+          <circle cx="24" cy="24" r="20" fill="none" stroke="#e8ff00" strokeWidth="4" strokeDasharray={`${2*Math.PI*20}`} strokeDashoffset={`${2*Math.PI*20*(1-pct/100)}`} strokeLinecap="round" style={{ transition: "stroke-dashoffset 1s linear" }} />
+        </svg>
+        <span style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Bebas Neue',sans-serif", fontSize: 15, color: "#e8ff00", transform: "rotate(90deg)" }}>{left}</span>
+      </div>
+      <div style={{ flex: 1 }}>
+        <div style={{ color: "#ccc", fontSize: 13, fontWeight: 500 }}>Rest period</div>
+        <div style={{ color: "#666", fontSize: 12 }}>Next set in {left}s</div>
+      </div>
+      <button onClick={onDone} style={{ background: "transparent", border: "1px solid #333", color: "#888", borderRadius: 6, padding: "5px 12px", fontSize: 12, cursor: "pointer" }}>Skip</button>
+    </div>
+  );
+}
+
+function ExerciseTimer({ totalSec, onDone }) {
+  const [left, setLeft] = useState(totalSec);
+  const [running, setRunning] = useState(true);
+  useEffect(() => {
+    if (!running || left <= 0) { if (left <= 0) onDone(); return; }
+    const t = setTimeout(() => setLeft(l => l - 1), 1000);
+    return () => clearTimeout(t);
+  }, [left, running, onDone]);
+  const pct = left / totalSec * 100;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 12px", background: "#181800", border: "1px solid #3a3a00", borderRadius: 8, marginTop: 6 }}>
+      <div style={{ position: "relative", width: 40, height: 40, flexShrink: 0 }}>
+        <svg width="40" height="40" style={{ transform: "rotate(-90deg)" }}>
+          <circle cx="20" cy="20" r="16" fill="none" stroke="#2a2a00" strokeWidth="3" />
+          <circle cx="20" cy="20" r="16" fill="none" stroke="#e8ff00" strokeWidth="3" strokeDasharray={`${2*Math.PI*16}`} strokeDashoffset={`${2*Math.PI*16*(1-pct/100)}`} strokeLinecap="round" style={{ transition: "stroke-dashoffset 1s linear" }} />
+        </svg>
+        <span style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Bebas Neue',sans-serif", fontSize: 13, color: "#e8ff00", transform: "rotate(90deg)" }}>{left}</span>
+      </div>
+      <span style={{ color: "#e8ff00", fontSize: 13, fontWeight: 600, flex: 1 }}>{left > 0 ? `${left}s remaining` : "Done!"}</span>
+      <button onClick={() => setRunning(r => !r)} style={{ background: "transparent", border: "1px solid #3a3a00", color: "#aaa800", borderRadius: 6, padding: "4px 10px", fontSize: 12, cursor: "pointer" }}>{running ? "Pause" : "Resume"}</button>
+    </div>
+  );
+}
+
+// ─── Exercise Card ────────────────────────────────────────────────────────────
+function ExerciseCard({ ex, onSetDone }) {
+  const [open, setOpen] = useState(false);
+  const [completedSets, setCompletedSets] = useState([]);
+  const [showRest, setShowRest] = useState(false);
+  const [showTimer, setShowTimer] = useState(false);
+  const totalSets = ex.sets;
+  const repsLabel = ex.timedSec ? `${ex.timedSec}s` : ex.steps20 ? "20 steps" : `${ex.reps} reps`;
+  const handleSetTap = () => {
+    const next = completedSets.length + 1;
+    if (next <= totalSets) {
+      const updated = [...completedSets, next];
+      setCompletedSets(updated);
+      onSetDone(updated.length, totalSets);
+      if (next < totalSets) setShowRest(true);
+    }
+  };
+  return (
+    <div style={{ background: "#1a1a1a", border: "1px solid #2e2e2e", borderRadius: 10, overflow: "hidden", marginBottom: 6 }}>
+      <div onClick={() => setOpen(o => !o)} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", cursor: "pointer", userSelect: "none" }}>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 600, fontSize: 14, color: completedSets.length === totalSets ? "#e8ff00" : "#f0f0f0" }}>{ex.name}</div>
+          <div style={{ fontSize: 12, color: "#666", marginTop: 2 }}>{ex.muscle}</div>
+        </div>
+        <div style={{ display: "flex", gap: 5 }}>
+          {Array.from({ length: totalSets }).map((_, i) => (
+            <div key={i} style={{ width: 9, height: 9, borderRadius: "50%", background: i < completedSets.length ? "#e8ff00" : "#2e2e2e", border: "1px solid " + (i < completedSets.length ? "#e8ff00" : "#444") }} />
+          ))}
+        </div>
+        <div style={{ fontSize: 13, color: "#e8ff00", fontWeight: 700, marginLeft: 8, minWidth: 52, textAlign: "right" }}>{totalSets}×{repsLabel}</div>
+        <span style={{ color: "#444", fontSize: 11, marginLeft: 6 }}>{open ? "▲" : "▼"}</span>
+      </div>
+      {open && (
+        <div style={{ padding: "0 14px 14px", borderTop: "1px solid #222" }}>
+          <div style={{ marginTop: 10 }}>
+            <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: "0.1em", color: "#e8ff00", marginBottom: 6 }}>How to perform</div>
+            <ol style={{ listStyle: "none", display: "flex", flexDirection: "column", gap: 5 }}>
+              {ex.steps.map((s, i) => (
+                <li key={i} style={{ fontSize: 13, color: "#ccc", paddingLeft: 22, position: "relative", lineHeight: 1.5 }}>
+                  <span style={{ position: "absolute", left: 0, color: "#e8ff00", fontWeight: 700, fontSize: 12 }}>{i+1}.</span>{s}
+                </li>
+              ))}
+            </ol>
+          </div>
+          <div style={{ marginTop: 10, background: "#161600", border: "1px solid #2e2e00", borderRadius: 8, padding: "8px 12px" }}>
+            <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: "0.1em", color: "#aaa800", marginBottom: 5 }}>Form cues</div>
+            <ul style={{ listStyle: "none", display: "flex", flexDirection: "column", gap: 4 }}>
+              {ex.cues.map((c, i) => (
+                <li key={i} style={{ fontSize: 12, color: "#bbb", paddingLeft: 16, position: "relative" }}>
+                  <span style={{ position: "absolute", left: 0, color: "#aaa800", fontSize: 11 }}>✓</span>{c}
+                </li>
+              ))}
+            </ul>
+          </div>
+          {ex.timedSec && (
+            <div style={{ marginTop: 10 }}>
+              <button onClick={e => { e.stopPropagation(); setShowTimer(t => !t); }} style={{ background: "#1a1a00", border: "1px solid #3a3a00", color: "#e8ff00", borderRadius: 6, padding: "6px 14px", fontSize: 12, cursor: "pointer", fontWeight: 600 }}>
+                {showTimer ? "Hide timer" : `▶ Start ${ex.timedSec}s timer`}
+              </button>
+              {showTimer && <ExerciseTimer totalSec={ex.timedSec} onDone={() => setShowTimer(false)} />}
+            </div>
+          )}
+          <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+            <button onClick={e => { e.stopPropagation(); handleSetTap(); }} disabled={completedSets.length >= totalSets}
+              style={{ background: completedSets.length >= totalSets ? "#222" : "#e8ff00", color: completedSets.length >= totalSets ? "#555" : "#000", border: "none", borderRadius: 8, padding: "8px 18px", fontSize: 13, fontWeight: 700, cursor: completedSets.length >= totalSets ? "not-allowed" : "pointer" }}>
+              {completedSets.length >= totalSets ? "✓ Done" : `Log set ${completedSets.length + 1}/${totalSets}`}
+            </button>
+            {completedSets.length > 0 && completedSets.length < totalSets && (
+              <button onClick={e => { e.stopPropagation(); setCompletedSets([]); onSetDone(0, totalSets); }} style={{ background: "transparent", border: "1px solid #333", color: "#666", borderRadius: 8, padding: "8px 12px", fontSize: 12, cursor: "pointer" }}>Reset</button>
+            )}
+          </div>
+          {showRest && <RestTimer seconds={ex.restSec} onDone={() => setShowRest(false)} />}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Score Results Screen ─────────────────────────────────────────────────────
+function ScoreResults({ scoreData, weekJackpot, elapsed, rpGained, oldRp, newRp, onBack }) {
+  const [phase, setPhase] = useState(0);
+  const [displayScore, setDisplayScore] = useState(0);
+  const [displayRp, setDisplayRp] = useState(oldRp);
+  const finalScore = scoreData.multiplied + (weekJackpot ? 500 : 0);
+  const oldInfo = getRankInfo(oldRp);
+  const newInfo = getRankInfo(newRp);
+  const rankUp = newInfo.tierIndex > oldInfo.tierIndex;
+  const rankDown = newInfo.tierIndex < oldInfo.tierIndex;
+
+  useEffect(() => {
+    const T = (ms, fn) => setTimeout(fn, ms);
+    const timers = [
+      T(600, () => setPhase(1)),
+      T(1400, () => setPhase(2)),
+      T(2200, () => setPhase(3)),
+      T(2400, () => { let start = null; const step = ts => { if (!start) start = ts; const p = Math.min(1, (ts - start) / 1200); setDisplayScore(Math.round(p * finalScore)); if (p < 1) requestAnimationFrame(step); }; requestAnimationFrame(step); }),
+      T(4000, () => setPhase(4)),
+      T(4200, () => { let start = null; const step = ts => { if (!start) start = ts; const p = Math.min(1, (ts - start) / 1500); setDisplayRp(Math.round(oldRp + p * rpGained)); if (p < 1) requestAnimationFrame(step); }; requestAnimationFrame(step); }),
+    ];
+    if (weekJackpot) timers.push(T(3800, () => setPhase(3.5)));
+    if (rankUp) timers.push(T(5800, () => setPhase(5)));
+    return () => timers.forEach(clearTimeout);
+  }, []);
+
+  const multColor = scoreData.totalMult >= 3 ? "#ff6b35" : scoreData.totalMult >= 2 ? "#e8ff00" : scoreData.totalMult >= 1.5 ? "#b8cc00" : "#888";
+  const mins = Math.round(elapsed / 60);
+  const rankIcons = { Iron: "⚙", Bronze: "🛡", Silver: "⚔", Gold: "👑", Platinum: "💎", Diamond: "🔷", Radiant: "✦" };
+
+  return (
+    <div style={{ padding: "1.5rem 1rem 3rem", maxWidth: 480, margin: "0 auto" }}>
+      <div style={{ textAlign: "center", marginBottom: 20 }}>
+        <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 13, color: "#555", letterSpacing: "0.2em", textTransform: "uppercase" }}>workout complete</div>
+        <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 88, lineHeight: 1, color: phase >= 3 ? (finalScore >= 300 ? "#ff00ff" : finalScore >= 150 ? "#e8ff00" : "#b8cc00") : "#333", transition: "color 0.5s", letterSpacing: "-0.02em", margin: "4px 0" }}>
+          {displayScore}
+        </div>
+        <div style={{ fontSize: 13, color: "#555" }}>{mins} min · {scoreData.fullCompletion ? "full completion" : `${scoreData.setsPts} set pts`}</div>
+      </div>
+
+      {/* Score breakdown */}
+      <div style={{ background: "#1a1a1a", border: "1px solid #2e2e2e", borderRadius: 12, padding: "12px 14px", marginBottom: 12 }}>
+        <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.1em", color: "#444", marginBottom: 8 }}>Score breakdown</div>
+        {[
+          ["Sets completed", `${scoreData.setsPts} pts`, "#ccc"],
+          ["Speed bonus", `+${scoreData.speedBonus}`, scoreData.speedBonus > 0 ? "#00e5ff" : "#333"],
+          ["Completion bonus", scoreData.completionBonus > 0 ? `+${scoreData.completionBonus}` : "—", scoreData.completionBonus > 0 ? "#e8ff00" : "#333"],
+        ].map(([l, v, c]) => (
+          <div key={l} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, padding: "4px 0", borderBottom: "1px solid #111" }}>
+            <span style={{ color: "#666" }}>{l}</span><span style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 15, color: c }}>{v}</span>
+          </div>
+        ))}
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, padding: "6px 0 0" }}>
+          <span style={{ color: "#ccc", fontWeight: 500 }}>Base score</span><span style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 20, color: "#f0f0f0" }}>{scoreData.base} pts</span>
+        </div>
+      </div>
+
+      {/* Multipliers */}
+      <div style={{ background: "#150a00", border: "1px solid #3a2000", borderRadius: 12, padding: "12px 14px", marginBottom: 12, opacity: phase >= 1 ? 1 : 0.2, transition: "opacity 0.5s" }}>
+        <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.1em", color: "#664400", marginBottom: 8 }}>Multipliers</div>
+        <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: "1px solid #1a0800" }}>
+          <span style={{ fontSize: 12, color: "#888" }}>Streak ({scoreData.streakDays} day{scoreData.streakDays !== 1 ? "s" : ""})</span>
+          <span style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 20, color: phase >= 1 ? (scoreData.streakMult >= 2 ? "#ff6b35" : "#e8ff00") : "#333" }}>×{scoreData.streakMult}</span>
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: "1px solid #1a0800" }}>
+          <span style={{ fontSize: 12, color: "#888" }}>Full completion</span>
+          <span style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 20, color: phase >= 2 ? (scoreData.completionMult > 1 ? "#e8ff00" : "#333") : "#333" }}>{scoreData.completionMult > 1 ? `×${scoreData.completionMult}` : "—"}</span>
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", padding: "6px 0 0" }}>
+          <span style={{ fontSize: 13, color: "#f0f0f0", fontWeight: 500 }}>Total multiplier</span>
+          <span style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 26, color: phase >= 2 ? multColor : "#333" }}>×{scoreData.totalMult}</span>
+        </div>
+      </div>
+
+      {/* After multipliers */}
+      <div style={{ background: "#0f0f00", border: "1px solid #2e2e00", borderRadius: 12, padding: "12px 14px", marginBottom: 12, opacity: phase >= 3 ? 1 : 0.2, transition: "opacity 0.5s" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontSize: 13, color: "#888" }}>After multipliers</span>
+          <span style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 28, color: "#e8ff00" }}>{scoreData.multiplied} pts</span>
+        </div>
+      </div>
+
+      {/* Week jackpot */}
+      {weekJackpot && (
+        <div style={{ background: phase >= 3.5 ? "#1a0030" : "#111", border: `1px solid ${phase >= 3.5 ? "#8800ff" : "#222"}`, borderRadius: 12, padding: "14px", marginBottom: 12, opacity: phase >= 3.5 ? 1 : 0.2, transition: "all 0.6s", textAlign: "center" }}>
+          <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 12, letterSpacing: "0.2em", color: phase >= 3.5 ? "#bf5fff" : "#444", marginBottom: 2 }}>WEEK COMPLETE JACKPOT</div>
+          <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 42, color: phase >= 3.5 ? "#ff00ff" : "#333", lineHeight: 1 }}>+500 pts</div>
+          <div style={{ fontSize: 11, color: "#664488", marginTop: 3 }}>4 workouts this week!</div>
+        </div>
+      )}
+
+      {/* RP Gained + Rank Progress */}
+      <div style={{ background: "#0a0a1a", border: `1px solid ${newInfo.rank.color}44`, borderRadius: 12, padding: "14px", marginBottom: 12, opacity: phase >= 4 ? 1 : 0.1, transition: "opacity 0.6s" }}>
+        <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.1em", color: newInfo.rank.color + "88", marginBottom: 10 }}>Rank Points</div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <RankBadge rp={displayRp} size="md" />
+            <div>
+              <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 18, color: getRankInfo(displayRp).rank.color, letterSpacing: "0.06em", lineHeight: 1 }}>{getRankInfo(displayRp).label}</div>
+              <div style={{ fontSize: 12, color: "#555", marginTop: 2 }}>{displayRp.toLocaleString()} RP</div>
+            </div>
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 24, color: "#00e5ff", lineHeight: 1 }}>+{rpGained}</div>
+            <div style={{ fontSize: 11, color: "#444" }}>RP gained</div>
+          </div>
+        </div>
+        {!getRankInfo(displayRp).isMax && (
+          <div style={{ background: "#111", borderRadius: 4, height: 8, overflow: "hidden" }}>
+            <div style={{ height: "100%", width: `${getRankInfo(displayRp).progress}%`, background: `linear-gradient(90deg, ${getRankInfo(displayRp).rank.color}88, ${getRankInfo(displayRp).rank.color})`, borderRadius: 4, transition: "width 0.3s ease" }} />
+          </div>
+        )}
+      </div>
+
+      {/* RANK UP banner */}
+      {rankUp && phase >= 5 && (
+        <div style={{ background: `${newInfo.rank.color}18`, border: `2px solid ${newInfo.rank.color}`, borderRadius: 12, padding: "20px", marginBottom: 12, textAlign: "center", boxShadow: `0 0 30px ${newInfo.rank.glow}44` }}>
+          <div style={{ fontSize: 32, marginBottom: 6 }}>{rankIcons[newInfo.rank.name]}</div>
+          <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 14, letterSpacing: "0.25em", color: newInfo.rank.color, marginBottom: 2 }}>RANK UP!</div>
+          <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 28, color: newInfo.rank.color, letterSpacing: "0.06em" }}>{newInfo.label}</div>
+          <div style={{ fontSize: 12, color: newInfo.rank.color + "88", marginTop: 4 }}>Welcome to {newInfo.rank.name}</div>
+        </div>
+      )}
+
+      {/* Badges */}
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "center", marginBottom: 20 }}>
+        {scoreData.fullCompletion && <span style={{ background: "#1a1a00", border: "1px solid #3a3a00", color: "#e8ff00", borderRadius: 20, padding: "4px 12px", fontSize: 11 }}>🏆 Perfect session</span>}
+        {scoreData.speedBonus >= 20 && <span style={{ background: "#001a10", border: "1px solid #003a20", color: "#00e5a0", borderRadius: 20, padding: "4px 12px", fontSize: 11 }}>⚡ Speed demon</span>}
+        {scoreData.streakMult >= 2 && <span style={{ background: "#1a0800", border: "1px solid #3a1800", color: "#ff6b35", borderRadius: 20, padding: "4px 12px", fontSize: 11 }}>🔥 {scoreData.streakDays}d streak</span>}
+        {weekJackpot && <span style={{ background: "#1a0030", border: "1px solid #4400aa", color: "#ff00ff", borderRadius: 20, padding: "4px 12px", fontSize: 11 }}>🎯 Week jackpot!</span>}
+        {rankUp && <span style={{ background: `${newInfo.rank.color}18`, border: `1px solid ${newInfo.rank.color}`, color: newInfo.rank.color, borderRadius: 20, padding: "4px 12px", fontSize: 11 }}>↑ Promoted!</span>}
+      </div>
+
+      <button onClick={onBack} style={{ width: "100%", background: "#e8ff00", color: "#000", border: "none", borderRadius: 10, padding: "14px", fontSize: 16, fontWeight: 700, cursor: "pointer", fontFamily: "'Bebas Neue',sans-serif", letterSpacing: "0.08em" }}>← BACK TO PLAN</button>
+    </div>
+  );
+}
+
+// ─── Workout View ─────────────────────────────────────────────────────────────
+function WorkoutView({ day, scores, streak, eloData, onComplete, onBack }) {
+  const scoreKey = `${todayKey()}_day${day.id}`;
+  const alreadyDone = !!scores[scoreKey];
+  const [setsState, setSetsState] = useState(() => day.exercises.reduce((a, _, i) => { a[i] = { done: 0, total: day.exercises[i].sets }; return a; }, {}));
+  const [started, setStarted] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [result, setResult] = useState(null);
+
+  useEffect(() => {
+    if (!started || result) return;
+    const t = setInterval(() => setElapsed(e => e + 1), 1000);
+    return () => clearInterval(t);
+  }, [started, result]);
+
+  const totalSetsNeeded = day.exercises.reduce((a, ex) => a + ex.sets, 0);
+  const totalSetsDone = Object.values(setsState).reduce((a, v) => a + v.done, 0);
+  const progress = Math.round(totalSetsDone / totalSetsNeeded * 100);
+  const streakMult = streak.count >= 5 ? 3 : streak.count >= 4 ? 2.5 : streak.count >= 3 ? 2 : streak.count >= 2 ? 1.5 : 1;
+  const currentInfo = getRankInfo(eloData.rp);
+
+  const handleFinish = () => {
+    const sd = calcScore({ totalSetsDone, totalSetsNeeded, elapsedSec: elapsed, streakDays: streak.count });
+    const tempScores = { ...scores, [scoreKey]: { score: sd.multiplied, elapsed } };
+    const jackpot = checkWeekJackpot(tempScores, todayKey());
+    const finalScore = sd.multiplied + (jackpot ? 500 : 0);
+    // RP = 10% of final score, rounded, min 5
+    const rpGained = Math.max(5, Math.round(finalScore * 0.1));
+    const oldRp = eloData.rp;
+    const newRp = oldRp + rpGained;
+    setResult({ sd, jackpot, finalScore, rpGained, oldRp, newRp });
+    onComplete(scoreKey, finalScore, elapsed, rpGained);
+  };
+
+  if (alreadyDone) return (
+    <div style={{ padding: "2rem 1rem", textAlign: "center" }}>
+      <div style={{ fontSize: 48, marginBottom: 12 }}>✅</div>
+      <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 26, color: "#e8ff00" }}>Already completed today!</div>
+      <div style={{ color: "#888", fontSize: 14, marginTop: 8 }}>Score: <span style={{ color: "#e8ff00" }}>{scores[scoreKey]?.score} pts</span></div>
+      <button onClick={onBack} style={{ marginTop: 24, background: "#e8ff00", color: "#000", border: "none", borderRadius: 8, padding: "10px 28px", fontSize: 14, fontWeight: 700, cursor: "pointer" }}>← Back</button>
+    </div>
+  );
+
+  if (result) return (
+    <ScoreResults scoreData={result.sd} weekJackpot={result.jackpot} elapsed={elapsed}
+      rpGained={result.rpGained} oldRp={result.oldRp} newRp={result.newRp} onBack={onBack} />
+  );
+
+  return (
+    <div style={{ maxWidth: 680, margin: "0 auto", padding: "0 0 3rem" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "1rem 0 0.5rem" }}>
+        <button onClick={onBack} style={{ background: "transparent", border: "1px solid #2e2e2e", color: "#888", borderRadius: 8, padding: "6px 14px", fontSize: 13, cursor: "pointer" }}>← Back</button>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 22, color: day.color, letterSpacing: "0.05em" }}>{day.title}</div>
+          <div style={{ fontSize: 12, color: "#666" }}>{day.muscles}</div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          {started && <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 18, color: "#888" }}>{pad(Math.floor(elapsed/60))}:{pad(elapsed%60)}</div>}
+          <RankBadge rp={eloData.rp} size="sm" />
+        </div>
+      </div>
+
+      {started && (
+        <div style={{ display: "flex", gap: 6, marginBottom: 10, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 11, border: `1px solid ${streak.count >= 2 ? "#3a2000" : "#222"}`, color: streak.count >= 2 ? "#ff6b35" : "#444", borderRadius: 20, padding: "3px 10px", background: streak.count >= 2 ? "#1a0800" : "transparent" }}>🔥 ×{streakMult} streak</span>
+          <span style={{ fontSize: 11, border: `1px solid ${progress === 100 ? "#3a3a00" : "#222"}`, color: progress === 100 ? "#e8ff00" : "#444", borderRadius: 20, padding: "3px 10px", background: progress === 100 ? "#1a1a00" : "transparent" }}>⚡ ×1.25 completion {progress === 100 ? "✓" : `(${progress}%)`}</span>
+          <span style={{ fontSize: 11, border: `1px solid ${currentInfo.rank.color}44`, color: currentInfo.rank.color, borderRadius: 20, padding: "3px 10px" }}>{currentInfo.label} · {eloData.rp.toLocaleString()} RP</span>
+        </div>
+      )}
+
+      <div style={{ background: "#1a1a1a", borderRadius: 8, height: 6, overflow: "hidden", marginBottom: 4 }}>
+        <div style={{ height: "100%", background: day.color, borderRadius: 8, width: `${progress}%`, transition: "width 0.4s ease" }} />
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#555", marginBottom: 14 }}>
+        <span>{totalSetsDone}/{totalSetsNeeded} sets</span><span>{progress}%</span>
+      </div>
+
+      {!started && (
+        <button onClick={() => setStarted(true)} style={{ width: "100%", background: day.color, color: "#000", border: "none", borderRadius: 10, padding: "14px", fontSize: 16, fontWeight: 700, cursor: "pointer", fontFamily: "'Bebas Neue',sans-serif", letterSpacing: "0.08em", marginBottom: 16 }}>START WORKOUT</button>
+      )}
+
+      <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: "0.12em", color: "#555", marginBottom: 8 }}>Warm-up · 5 min</div>
+      {day.warmup.map((w, i) => (
+        <div key={i} style={{ background: "#161616", border: "1px solid #222", borderRadius: 8, padding: "8px 14px", marginBottom: 5, fontSize: 13 }}>
+          <span style={{ color: "#ccc", fontWeight: 500 }}>{w.name}</span><span style={{ color: "#555", marginLeft: 8 }}>{w.note}</span>
+        </div>
+      ))}
+
+      <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: "0.12em", color: "#555", margin: "14px 0 8px" }}>Main work</div>
+      {day.exercises.map((ex, i) => (
+        <ExerciseCard key={i} ex={ex} onSetDone={(done, total) => setSetsState(s => ({ ...s, [i]: { done, total } }))} />
+      ))}
+
+      <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: "0.12em", color: "#555", margin: "14px 0 8px" }}>Cool-down</div>
+      {day.cooldown.map((c, i) => (
+        <div key={i} style={{ background: "#161616", border: "1px solid #222", borderRadius: 8, padding: "8px 14px", marginBottom: 5, fontSize: 13 }}>
+          <span style={{ color: "#ccc", fontWeight: 500 }}>{c.name}</span><span style={{ color: "#555", marginLeft: 8 }}>{c.note}</span>
+        </div>
+      ))}
+
+      {started && progress > 0 && (
+        <button onClick={handleFinish} style={{ width: "100%", marginTop: 20, background: progress === 100 ? "#e8ff00" : "#1a1a1a", color: progress === 100 ? "#000" : "#888", border: `1px solid ${progress === 100 ? "#e8ff00" : "#333"}`, borderRadius: 10, padding: "14px", fontSize: 15, fontWeight: 700, cursor: "pointer", fontFamily: "'Bebas Neue',sans-serif", letterSpacing: "0.08em" }}>
+          {progress === 100 ? "🏆 COMPLETE WORKOUT" : `FINISH (${progress}% done)`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ─── Rank Ladder ──────────────────────────────────────────────────────────────
+function RankLadder({ currentRp }) {
+  const currentInfo = getRankInfo(currentRp);
+  const rankIcons = { Iron: "⚙", Bronze: "🛡", Silver: "⚔", Gold: "👑", Platinum: "💎", Diamond: "🔷", Radiant: "✦" };
+  return (
+    <div style={{ background: "#1a1a1a", border: "1px solid #2e2e2e", borderRadius: 12, overflow: "hidden", marginBottom: 16 }}>
+      <div style={{ padding: "12px 14px", borderBottom: "1px solid #222", fontSize: 11, textTransform: "uppercase", letterSpacing: "0.1em", color: "#555" }}>Rank ladder</div>
+      {RANKS.slice().reverse().map(rank => {
+        const tiers = rank.divisions === 1 ? [{ div: 1, rp: rank.thresholds[0] }] : rank.thresholds.map((rp, i) => ({ div: rank.divisions - i, rp }));
+        const isCurrentRank = rank.name === currentInfo.rank.name;
+        const decay = DECAY_BY_RANK[rank.name];
+        return (
+          <div key={rank.name} style={{ borderBottom: "1px solid #1a1a1a" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 14px", background: isCurrentRank ? `${rank.color}0a` : "transparent" }}>
+              <span style={{ fontSize: 18, width: 24, textAlign: "center" }}>{rankIcons[rank.name]}</span>
+              <div style={{ flex: 1 }}>
+                <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 15, color: rank.color, letterSpacing: "0.06em" }}>{rank.name}</div>
+                <div style={{ display: "flex", gap: 6, marginTop: 3, flexWrap: "wrap" }}>
+                  {tiers.map(({ div, rp }) => {
+                    const tierLabel = rank.divisions === 1 ? rank.name : `${rank.name} ${["III","II","I"][div-1]}`;
+                    const isCurrent = tierLabel === currentInfo.label;
+                    return (
+                      <span key={div} style={{ fontSize: 10, padding: "2px 7px", borderRadius: 10, background: isCurrent ? rank.color : "transparent", color: isCurrent ? "#000" : "#444", border: `1px solid ${isCurrent ? rank.color : "#2a2a2a"}`, fontWeight: isCurrent ? 700 : 400 }}>
+                        {rank.divisions === 1 ? `${rp.toLocaleString()} RP` : `${["III","II","I"][div-1]} · ${rp.toLocaleString()}`}
+                      </span>
+                    );
+                  })}
+                </div>
+                <div style={{ fontSize: 10, color: "#383838", marginTop: 3 }}>
+                  Need {decay.threshold} RP/week · miss = <span style={{ color: "#7a2020" }}>−{decay.loss} RP</span> · can drop divisions
+                </div>
+              </div>
+              {isCurrentRank && <span style={{ fontSize: 11, color: rank.color, border: `1px solid ${rank.color}44`, borderRadius: 10, padding: "2px 8px", flexShrink: 0 }}>YOU</span>}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Calendar & Scoreboard ────────────────────────────────────────────────────
+function MonthCalendar({ scores, viewYear, viewMonth, onPrev, onNext, onDayClick, selectedDate }) {
+  const today = new Date();
+  const isCurrentMonth = viewYear === today.getFullYear() && viewMonth === today.getMonth();
+  const firstDay = new Date(viewYear, viewMonth, 1);
+  let startOffset = firstDay.getDay() - 1; if (startOffset < 0) startOffset = 6;
+  const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
+  const cells = []; for (let i = 0; i < startOffset; i++) cells.push(null); for (let d = 1; d <= daysInMonth; d++) cells.push(d);
+  while (cells.length % 7 !== 0) cells.push(null);
+  const todayStr = today.toISOString().slice(0,10);
+
+  const getDayData = d => {
+    if (!d) return null;
+    const dateStr = `${viewYear}-${pad(viewMonth+1)}-${pad(d)}`;
+    const dayEntries = Object.entries(scores).filter(([k]) => k.startsWith(dateStr));
+    const hasWorkout = dayEntries.length > 0;
+    const totalScore = hasWorkout ? dayEntries.reduce((a, [,v]) => a + v.score, 0) : 0;
+    const workoutTypes = dayEntries.map(([k]) => DAYS.find(d => d.id === parseInt(k.split("_day")[1]))).filter(Boolean);
+    return { dateStr, hasWorkout, totalScore, workoutTypes, isToday: dateStr === todayStr, isFuture: new Date(dateStr+"T12:00:00") > today, isSelected: dateStr === selectedDate };
+  };
+
+  const monthSessions = Object.entries(scores).filter(([k]) => k.startsWith(`${viewYear}-${pad(viewMonth+1)}`));
+  const monthTotal = monthSessions.reduce((a,[,v]) => a + v.score, 0);
+
+  return (
+    <div style={{ background: "#1a1a1a", border: "1px solid #2e2e2e", borderRadius: 12, overflow: "hidden", marginBottom: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", padding: "12px 14px 10px", borderBottom: "1px solid #222" }}>
+        <button onClick={onPrev} style={{ background: "transparent", border: "1px solid #2e2e2e", color: "#888", borderRadius: 6, width: 32, height: 32, cursor: "pointer", fontSize: 14 }}>‹</button>
+        <div style={{ flex: 1, textAlign: "center" }}>
+          <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 20, color: "#f0f0f0", letterSpacing: "0.06em" }}>{MONTH_NAMES[viewMonth]} {viewYear}</div>
+          {monthSessions.length > 0 && <div style={{ fontSize: 10, color: "#555" }}>{monthSessions.length} sessions · {monthTotal.toLocaleString()} pts</div>}
+        </div>
+        <button onClick={onNext} disabled={isCurrentMonth} style={{ background: "transparent", border: "1px solid #2e2e2e", color: isCurrentMonth ? "#333" : "#888", borderRadius: 6, width: 32, height: 32, cursor: isCurrentMonth ? "not-allowed" : "pointer", fontSize: 14 }}>›</button>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 1, padding: "8px 12px 4px" }}>
+        {DAY_LABELS.map(d => <div key={d} style={{ textAlign: "center", fontSize: 10, color: "#444", fontWeight: 500 }}>{d}</div>)}
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 3, padding: "0 12px 12px" }}>
+        {cells.map((d, idx) => {
+          const data = getDayData(d); if (!d) return <div key={idx} />;
+          const bg = data.isFuture ? "transparent" : data.hasWorkout ? scoreColor(data.totalScore) : "#161616";
+          const textColor = data.isFuture ? "#2a2a2a" : data.hasWorkout ? (data.totalScore >= 200 ? "#000" : "#e8ff00") : (data.isToday ? "#e8ff00" : "#555");
+          const border = data.isSelected ? "1.5px solid #e8ff00" : data.isToday ? "1.5px solid #555" : "1px solid #1e1e1e";
+          return (
+            <div key={idx} onClick={() => !data.isFuture && onDayClick(data.dateStr)} title={data.hasWorkout ? `${data.dateStr} · ${data.totalScore}pts` : data.dateStr}
+              style={{ background: bg, border, borderRadius: 6, padding: "4px 2px", textAlign: "center", cursor: data.isFuture ? "default" : "pointer", minHeight: 40, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+              <div style={{ fontSize: 12, fontWeight: data.isToday ? 700 : 400, color: textColor, lineHeight: 1 }}>{d}</div>
+              {data.hasWorkout && <div style={{ fontSize: 9, fontFamily: "'Bebas Neue',sans-serif", color: data.totalScore >= 200 ? "rgba(0,0,0,0.6)" : "#e8ff00", marginTop: 1 }}>{data.totalScore}</div>}
+              {data.hasWorkout && <div style={{ display: "flex", gap: 2, marginTop: 2 }}>{data.workoutTypes.slice(0,3).map((w,i) => <div key={i} style={{ width: 4, height: 4, borderRadius: "50%", background: data.totalScore >= 200 ? "rgba(0,0,0,0.4)" : w.color }} />)}</div>}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function DayDetail({ dateStr, scores }) {
+  const entries = Object.entries(scores).filter(([k]) => k.startsWith(dateStr));
+  if (!entries.length) return null;
+  const d = new Date(dateStr + "T12:00:00");
+  const label = d.toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric" });
+  return (
+    <div style={{ background: "#141400", border: "1px solid #3a3a00", borderRadius: 10, padding: "12px 16px", marginBottom: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+        <div style={{ fontSize: 12, color: "#aaa800" }}>{label}</div>
+        <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 18, color: "#e8ff00" }}>{entries.reduce((a,[,v]) => a+v.score, 0)} pts</div>
+      </div>
+      {entries.map(([key, val]) => {
+        const dayData = DAYS.find(d => d.id === parseInt(key.split("_day")[1]));
+        return (
+          <div key={key} style={{ display: "flex", alignItems: "center", gap: 10, padding: "5px 0", borderBottom: "1px solid #1e1e00" }}>
+            <div style={{ width: 7, height: 7, borderRadius: "50%", background: dayData?.color || "#e8ff00" }} />
+            <div style={{ flex: 1 }}><div style={{ fontSize: 13, color: "#ddd" }}>{dayData?.title || "Workout"}</div><div style={{ fontSize: 11, color: "#666" }}>{Math.round(val.elapsed/60)} min</div></div>
+            <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 22, color: scoreColor(val.score) }}>{val.score}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ScoreBoard({ scores, streak, eloData }) {
+  const today = new Date();
+  const [viewYear, setViewYear] = useState(today.getFullYear());
+  const [viewMonth, setViewMonth] = useState(today.getMonth());
+  const [selectedDate, setSelectedDate] = useState(null);
+  const [tab, setTab] = useState("stats"); // stats | ranks | history
+
+  const allScores = Object.values(scores);
+  const totalWorkouts = allScores.length;
+  const totalPoints = allScores.reduce((a, v) => a + v.score, 0);
+  const bestScore = totalWorkouts ? Math.max(...allScores.map(v => v.score)) : 0;
+
+  const yearPts = Array.from({ length: 12 }, (_, m) => {
+    const prefix = `${viewYear}-${pad(m+1)}`;
+    return Object.entries(scores).filter(([k]) => k.startsWith(prefix)).reduce((a,[,v]) => a+v.score, 0);
+  });
+  const maxPts = Math.max(1, ...yearPts);
+
+  const currentRankInfo = getRankInfo(eloData.rp);
+  const currentDecay = DECAY_BY_RANK[currentRankInfo.rank.name];
+  const wk = weekKey(todayKey());
+  const weekEarned = Object.entries(scores).filter(([k]) => {
+    const date = k.split("_")[0]; return weekKey(date) === wk;
+  }).reduce((a,[,v]) => a+(v.rpGained||0), 0);
+  const decayRisk = weekEarned < currentDecay.threshold;
+
+  return (
+    <div style={{ maxWidth: 680, margin: "0 auto", padding: "0 0 3rem" }}>
+      <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 28, color: "#f0f0f0", letterSpacing: "0.05em", margin: "1rem 0 0.75rem" }}>YOUR <span style={{ color: "#e8ff00" }}>PROGRESS</span></div>
+
+      {/* Rank card */}
+      <RankProgressBar rp={eloData.rp} />
+
+      {/* Decay warning */}
+      {decayRisk && (
+        <div style={{ background: "#1a0800", border: "1px solid #8b2200", borderRadius: 10, padding: "10px 14px", marginTop: 10, marginBottom: 0, display: "flex", gap: 10, alignItems: "center" }}>
+          <span style={{ fontSize: 18 }}>⚠️</span>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 13, color: "#ff6b35", fontWeight: 600 }}>Decay risk — {currentRankInfo.label}</div>
+            <div style={{ fontSize: 11, color: "#664020", marginTop: 2 }}>Earn {currentDecay.threshold - weekEarned} more RP this week or lose {currentDecay.loss} RP on Monday. Can drop full divisions.</div>
+          </div>
+        </div>
+      )}
+
+      {/* Sub-tabs */}
+      <div style={{ display: "flex", gap: 6, margin: "16px 0 12px" }}>
+        {[["stats","Stats"],["ranks","Ranks"],["history","RP History"]].map(([v,l]) => (
+          <button key={v} onClick={() => setTab(v)} style={{ background: tab===v ? "#e8ff00" : "transparent", color: tab===v ? "#000" : "#555", border: `1px solid ${tab===v ? "#e8ff00" : "#2e2e2e"}`, borderRadius: 8, padding: "5px 14px", fontSize: 12, cursor: "pointer", fontWeight: tab===v ? 700 : 400 }}>{l}</button>
+        ))}
+      </div>
+
+      {tab === "stats" && (
+        <>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8, marginBottom: 14 }}>
+            {[
+              { label: "Streak", value: streak.count, unit: "days", color: "#ff6b35" },
+              { label: "Sessions", value: totalWorkouts, unit: "total", color: "#e8ff00" },
+              { label: "Total points", value: totalPoints.toLocaleString(), unit: "scored", color: "#bf5fff" },
+              { label: "Best session", value: bestScore || "—", unit: "pts", color: "#00e5ff" },
+            ].map((s,i) => (
+              <div key={i} style={{ background: "#1a1a1a", border: "1px solid #2e2e2e", borderRadius: 10, padding: "10px 12px" }}>
+                <div style={{ fontSize: 10, color: "#555", textTransform: "uppercase", letterSpacing: "0.1em" }}>{s.label}</div>
+                <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 26, color: s.color, lineHeight: 1.1, marginTop: 3 }}>{s.value}</div>
+                <div style={{ fontSize: 10, color: "#444" }}>{s.unit}</div>
+              </div>
+            ))}
+          </div>
+          {totalWorkouts > 0 && (
+            <div style={{ background: "#1a1a1a", border: "1px solid #2e2e2e", borderRadius: 10, padding: "12px 14px", marginBottom: 14 }}>
+              <div style={{ fontSize: 11, color: "#555", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 10 }}>{viewYear} — pts by month</div>
+              <div style={{ display: "flex", gap: 4, alignItems: "flex-end", height: 48 }}>
+                {yearPts.map((pts, m) => {
+                  const isActive = m === viewMonth;
+                  const h = pts === 0 ? 3 : Math.max(6, Math.round(pts / maxPts * 44));
+                  return (
+                    <div key={m} onClick={() => { setViewMonth(m); setSelectedDate(null); }} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 3, cursor: "pointer" }}>
+                      <div style={{ width: "100%", height: h, minHeight: 3, background: isActive ? "#e8ff00" : pts > 0 ? "#3a3a00" : "#1e1e1e", borderRadius: 3 }} />
+                      <div style={{ fontSize: 9, color: isActive ? "#e8ff00" : "#444" }}>{MONTH_NAMES[m].slice(0,1)}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+          <MonthCalendar scores={scores} viewYear={viewYear} viewMonth={viewMonth}
+            onPrev={() => { if (viewMonth===0) { setViewYear(y=>y-1); setViewMonth(11); } else setViewMonth(m=>m-1); setSelectedDate(null); }}
+            onNext={() => { if (viewMonth===11) { setViewYear(y=>y+1); setViewMonth(0); } else setViewMonth(m=>m+1); setSelectedDate(null); }}
+            onDayClick={setSelectedDate} selectedDate={selectedDate} />
+          {selectedDate && <DayDetail dateStr={selectedDate} scores={scores} />}
+          {totalWorkouts > 0 && (
+            <div style={{ background: "#1a1a1a", border: "1px solid #2e2e2e", borderRadius: 10, padding: "12px 14px" }}>
+              <div style={{ fontSize: 11, color: "#555", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 8 }}>All sessions</div>
+              <div style={{ maxHeight: 280, overflowY: "auto" }}>
+                {Object.entries(scores).sort((a,b) => b[0].localeCompare(a[0])).map(([key, val]) => {
+                  const [date, dp] = key.split("_");
+                  const dayData = DAYS.find(d => d.id === parseInt(dp?.replace("day","")||"0"));
+                  const d = new Date(date+"T12:00:00");
+                  const label = d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+                  return (
+                    <div key={key} onClick={() => { setSelectedDate(date); setViewMonth(d.getMonth()); setViewYear(d.getFullYear()); }}
+                      style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 0", borderBottom: "1px solid #1e1e1e", cursor: "pointer" }}>
+                      <div style={{ width: 7, height: 7, borderRadius: "50%", background: dayData?.color||"#e8ff00" }} />
+                      <div style={{ flex: 1 }}><div style={{ fontSize: 13, color: "#ccc" }}>{dayData?.title||"Workout"}</div><div style={{ fontSize: 11, color: "#555" }}>{label} · {Math.round(val.elapsed/60)} min</div></div>
+                      <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 20, color: scoreColor(val.score) }}>{val.score}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {tab === "ranks" && <RankLadder currentRp={eloData.rp} />}
+
+      {tab === "history" && (
+        <div style={{ background: "#1a1a1a", border: "1px solid #2e2e2e", borderRadius: 12, padding: "12px 14px" }}>
+          <div style={{ fontSize: 11, color: "#555", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 10 }}>RP history</div>
+          {(eloData.history || []).length === 0 && <div style={{ fontSize: 13, color: "#444", textAlign: "center", padding: "2rem 0" }}>No RP history yet</div>}
+          {(eloData.history || []).map((h, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "8px 0", borderBottom: "1px solid #1e1e1e" }}>
+              <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 20, color: h.rp > 0 ? "#00e5ff" : "#ff4444", minWidth: 60, textAlign: "right" }}>{h.rp > 0 ? `+${h.rp}` : h.rp}</div>
+              <div style={{ flex: 1 }}><div style={{ fontSize: 13, color: "#ccc" }}>{h.label}</div><div style={{ fontSize: 11, color: "#555" }}>{h.date} · {h.newTotal.toLocaleString()} RP total</div></div>
+              <RankBadge rp={h.newTotal} size="sm" />
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── App ──────────────────────────────────────────────────────────────────────
+function App() {
+  const [scores, setScores] = useState(() => loadScores());
+  const [streak, setStreak] = useState(() => loadStreak());
+  const [eloData, setEloData] = useState(() => {
+    const raw = loadElo();
+    // Apply decay on load (if it's a new week)
+    const decayed = applyDecay(raw, loadScores());
+    if (decayed.rp !== raw.rp) saveElo(decayed);
+    return decayed;
+  });
+  const [activeDay, setActiveDay] = useState(null);
+  const [view, setView] = useState("plan");
+
+  const handleComplete = useCallback((key, finalScore, elapsed, rpGained) => {
+    const newScores = { ...scores, [key]: { score: finalScore, elapsed, rpGained, ts: Date.now() } };
+    setScores(newScores);
+    saveScores(newScores);
+
+    const today = todayKey();
+    const yesterday = new Date(); yesterday.setDate(yesterday.getDate() - 1);
+    const yKey = yesterday.toISOString().slice(0, 10);
+    let newStreak = { ...streak };
+    if (streak.lastDate === today) {}
+    else if (streak.lastDate === yKey) newStreak = { count: streak.count + 1, lastDate: today };
+    else newStreak = { count: 1, lastDate: today };
+    setStreak(newStreak);
+    saveStreak(newStreak);
+
+    const newRp = eloData.rp + rpGained;
+    const rankInfo = getRankInfo(newRp);
+    const historyEntry = { type: "workout", rp: rpGained, newTotal: newRp, date: today, label: `Workout completed (+${rpGained} RP)` };
+    const newElo = { rp: newRp, lastDecayWeek: eloData.lastDecayWeek || weekKey(today), history: [historyEntry, ...(eloData.history || [])].slice(0, 50) };
+    setEloData(newElo);
+    saveElo(newElo);
+  }, [scores, streak, eloData]);
+
+  const totalToday = DAYS.filter(d => !!scores[`${todayKey()}_day${d.id}`]).length;
+  const rankInfo = getRankInfo(eloData.rp);
+
+  if (activeDay) return (
+    <div style={{ background: "#0f0f0f", minHeight: "100vh", color: "#f0f0f0", fontFamily: "'DM Sans',sans-serif", padding: "0 1rem" }}>
+      <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+      <WorkoutView day={activeDay} scores={scores} streak={streak} eloData={eloData} onComplete={handleComplete} onBack={() => setActiveDay(null)} />
+    </div>
+  );
+
+  return (
+    <div style={{ background: "#0f0f0f", minHeight: "100vh", color: "#f0f0f0", fontFamily: "'DM Sans',sans-serif" }}>
+      <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+      <div style={{ maxWidth: 680, margin: "0 auto", padding: "0 1rem 4rem" }}>
+
+        <div style={{ textAlign: "center", padding: "2rem 0 1.5rem" }}>
+          <div style={{ width: 60, height: 4, background: "#e8ff00", margin: "0 auto 1rem" }} />
+          <h1 style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: "clamp(2.5rem,9vw,4.5rem)", letterSpacing: "0.04em", lineHeight: 0.95, margin: 0 }}>
+            HOME<br /><span style={{ color: "#e8ff00" }}>STRENGTH</span><br />PLAN
+          </h1>
+          {/* Rank display in header */}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 12, marginTop: 14 }}>
+            <RankBadge rp={eloData.rp} size="md" />
+            <div style={{ textAlign: "left" }}>
+              <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 20, color: rankInfo.rank.color, letterSpacing: "0.06em", lineHeight: 1 }}>{rankInfo.label}</div>
+              <div style={{ fontSize: 11, color: "#555" }}>{eloData.rp.toLocaleString()} RP</div>
+              {!rankInfo.isMax && (
+                <div style={{ fontSize: 10, color: "#444", marginTop: 2 }}>{rankInfo.rpToNext.toLocaleString()} RP to {RP_THRESHOLDS[rankInfo.tierIndex + 1] ? getRankInfo(RP_THRESHOLDS[rankInfo.tierIndex+1].rp).label : "max"}</div>
+              )}
+            </div>
+          </div>
+          {/* RP bar */}
+          {!rankInfo.isMax && (
+            <div style={{ maxWidth: 240, margin: "8px auto 0" }}>
+              <div style={{ background: "#1a1a1a", borderRadius: 4, height: 5, overflow: "hidden" }}>
+                <div style={{ height: "100%", width: `${rankInfo.progress}%`, background: rankInfo.rank.color, borderRadius: 4, transition: "width 0.6s ease", boxShadow: `0 0 8px ${rankInfo.rank.glow}55` }} />
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div style={{ display: "flex", gap: 8, justifyContent: "center", marginBottom: 20 }}>
+          {[["plan","Workout Plan"],["progress",`Progress${Object.keys(scores).length>0 ? ` (${Object.keys(scores).length})` : ""}`]].map(([v,label]) => (
+            <button key={v} onClick={() => setView(v)} style={{ background: view===v ? "#e8ff00" : "transparent", color: view===v ? "#000" : "#666", border: `1px solid ${view===v ? "#e8ff00" : "#2e2e2e"}`, borderRadius: 8, padding: "7px 20px", fontSize: 13, fontWeight: view===v ? 700 : 400, cursor: "pointer", transition: "all 0.2s" }}>{label}</button>
+          ))}
+        </div>
+
+        {view === "plan" && (
+          <>
+            {streak.count > 0 && (
+              <div style={{ background: "#1a0d00", border: "1px solid #3a2000", borderRadius: 10, padding: "10px 16px", marginBottom: 12, display: "flex", alignItems: "center", gap: 10 }}>
+                <span style={{ fontSize: 20 }}>🔥</span>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 18, color: "#ff6b35", letterSpacing: "0.05em" }}>{streak.count} DAY STREAK</div>
+                  <div style={{ fontSize: 12, color: "#664020" }}>{streak.count >= 5 ? "×3.0 — MAX MULTIPLIER!" : streak.count >= 4 ? "×2.5 — one more for max!" : streak.count >= 3 ? "×2.0 — keep it going!" : streak.count >= 2 ? "×1.5 — don't break the chain!" : "Come back tomorrow for ×1.5"}</div>
+                </div>
+                <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 22, color: "#ff6b35" }}>×{streak.count >= 5 ? 3 : streak.count >= 4 ? 2.5 : streak.count >= 3 ? 2 : streak.count >= 2 ? 1.5 : 1}</div>
+              </div>
+            )}
+            {totalToday > 0 && (
+              <div style={{ background: "#001a0a", border: "1px solid #003a1a", borderRadius: 10, padding: "10px 16px", marginBottom: 12, display: "flex", alignItems: "center", gap: 10 }}>
+                <span>✅</span><div style={{ fontSize: 13, color: "#00c870" }}>{totalToday} workout{totalToday>1?"s":""} logged today</div>
+              </div>
+            )}
+            <div style={{ display: "grid", gap: 10 }}>
+              {DAYS.map(day => {
+                const sk = `${todayKey()}_day${day.id}`;
+                const todayScore = scores[sk];
+                const allDayScores = Object.entries(scores).filter(([k]) => k.includes(`_day${day.id}`));
+                const personalBest = allDayScores.length ? Math.max(...allDayScores.map(([,v]) => v.score)) : null;
+                return (
+                  <div key={day.id} onClick={() => setActiveDay(day)}
+                    style={{ background: "#1a1a1a", border: `1px solid ${todayScore ? day.color : "#2e2e2e"}`, borderRadius: 12, padding: "14px 16px", cursor: "pointer", transition: "transform 0.1s", userSelect: "none" }}
+                    onMouseEnter={e => e.currentTarget.style.transform="translateY(-1px)"}
+                    onMouseLeave={e => e.currentTarget.style.transform="none"}>
+                    <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+                      <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 32, color: day.color, lineHeight: 1, minWidth: 38 }}>0{day.id}</div>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 19, letterSpacing: "0.05em" }}>{day.title}</div>
+                        <div style={{ fontSize: 11, color: "#555", textTransform: "uppercase", letterSpacing: "0.06em", marginTop: 1 }}>{day.muscles}</div>
+                      </div>
+                      <div style={{ textAlign: "right" }}>
+                        {todayScore ? <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 26, color: scoreColor(todayScore.score), lineHeight: 1 }}>{todayScore.score}</div>
+                          : <div style={{ background: day.color, color: "#000", borderRadius: 8, padding: "5px 12px", fontSize: 12, fontWeight: 700 }}>Start →</div>}
+                        {personalBest && <div style={{ fontSize: 10, color: "#444", marginTop: 3 }}>PB: {personalBest}</div>}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", gap: 7, marginTop: 10 }}>
+                      <span style={{ fontSize: 10, color: "#555", border: "1px solid #2a2a2a", borderRadius: 20, padding: "2px 9px" }}>⏱ {day.duration} min</span>
+                      <span style={{ fontSize: 10, color: "#555", border: "1px solid #2a2a2a", borderRadius: 20, padding: "2px 9px" }}>{day.exercises.length} exercises</span>
+                      {todayScore && <span style={{ fontSize: 10, color: day.color, border: `1px solid ${day.color}33`, borderRadius: 20, padding: "2px 9px" }}>✓ Done</span>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            <div style={{ background: "#0a0a1a", border: `1px solid ${rankInfo.rank.color}33`, borderRadius: 10, padding: "12px 14px", marginTop: 14 }}>
+              <div style={{ fontFamily: "'Bebas Neue',sans-serif", fontSize: 14, color: rankInfo.rank.color, letterSpacing: "0.06em", marginBottom: 8 }}>⚡ COMPOUNDING SCORES + RANKS</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "3px 14px" }}>
+                {[["Base","up to 100 pts"],["2d streak","×1.5"],["3d streak","×2.0"],["4d streak","×2.5"],["5d+ streak","×3.0"],["All sets done","×1.25 extra"],["Full week","FLAT +500!"],["RP gained","score × 10%"]].map(([l,v]) => (
+                  <div key={l} style={{ display: "flex", justifyContent: "space-between", fontSize: 11, padding: "2px 0" }}>
+                    <span style={{ color: "#444" }}>{l}</span>
+                    <span style={{ color: v.includes("500") ? "#ff00ff" : v.includes("×3") ? "#ff6b35" : v.includes("×2") || v.includes("×1") ? "#e8ff00" : "#888", fontWeight: 600 }}>{v}</span>
+                  </div>
+                ))}
+              </div>
+              <div style={{ fontSize: 10, color: "#333", marginTop: 8, borderTop: "1px solid #1a1a2a", paddingTop: 6 }}>
+                Decay scales with rank — Iron loses 100 RP/week, Radiant loses 700 RP/week. No floor: can drop full divisions. Only floor is 0 RP.
+              </div>
+            </div>
+          </>
+        )}
+
+        {view === "progress" && <ScoreBoard scores={scores} streak={streak} eloData={eloData} />}
+      </div>
+    </div>
+  );
+}
+
+
+// Mount the app
+const container = document.getElementById('root');
+const reactRoot = ReactDOM.createRoot(container);
+reactRoot.render(React.createElement(App));
+document.getElementById('loading').style.display = 'none';
+</script>
+
+<script>
+// PWA: Register service worker for offline support
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    // Inline service worker as blob URL
+    const swCode = `
+const CACHE = 'strength-plan-v1';
+const URLS = [
+  self.location.href,
+  'https://fonts.googleapis.com/css2?family=Bebas+Neue&family=DM+Sans:wght@400;500;600&display=swap',
+];
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(URLS).catch(() => {})));
+  self.skipWaiting();
+});
+self.addEventListener('activate', e => {
+  e.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))));
+  self.clients.claim();
+});
+self.addEventListener('fetch', e => {
+  e.respondWith(
+    caches.match(e.request).then(r => r || fetch(e.request).then(res => {
+      const clone = res.clone();
+      caches.open(CACHE).then(c => c.put(e.request, clone)).catch(() => {});
+      return res;
+    })).catch(() => caches.match(e.request))
+  );
+});
+    `;
+    const blob = new Blob([swCode], { type: 'application/javascript' });
+    const swUrl = URL.createObjectURL(blob);
+    navigator.serviceWorker.register(swUrl).catch(() => {});
+  });
+}
+
+// PWA: Inline manifest for "Add to Home Screen"
+const manifest = {
+  name: "Home Strength Plan",
+  short_name: "Strength",
+  description: "Your personal home workout tracker with ELO ranks",
+  start_url: window.location.href,
+  display: "standalone",
+  background_color: "#0f0f0f",
+  theme_color: "#0f0f0f",
+  orientation: "portrait",
+  icons: [
+    {
+      src: "data:image/svg+xml," + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" fill="#0f0f0f"/><text y="320" x="60" font-size="320" font-family="sans-serif" fill="#e8ff00">💪</text></svg>'),
+      sizes: "512x512",
+      type: "image/svg+xml",
+      purpose: "any maskable"
+    }
+  ]
+};
+const manifestBlob = new Blob([JSON.stringify(manifest)], { type: 'application/json' });
+const manifestUrl = URL.createObjectURL(manifestBlob);
+document.querySelector('link[rel="manifest"]').href = manifestUrl;
+</script>
+</body>
+</html>
